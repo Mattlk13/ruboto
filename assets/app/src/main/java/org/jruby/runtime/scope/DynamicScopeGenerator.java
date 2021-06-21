@@ -1,9 +1,14 @@
 package org.jruby.runtime.scope;
 
-import com.android.dx.*;
-import me.qmx.jitescript.CodeBlock;
-import me.qmx.jitescript.JDKVersion;
-import me.qmx.jitescript.JiteClass;
+import com.android.dx.BinaryOp;
+import com.android.dx.Code;
+import com.android.dx.Comparison;
+import com.android.dx.DexMaker;
+import com.android.dx.FieldId;
+import com.android.dx.Local;
+import com.android.dx.MethodId;
+import com.android.dx.TypeId;
+
 import org.jruby.Ruby;
 import org.jruby.parser.StaticScope;
 import org.jruby.runtime.DynamicScope;
@@ -12,21 +17,19 @@ import org.jruby.util.ClassDefiningClassLoader;
 import org.jruby.util.OneShotClassLoader;
 import org.jruby.util.collections.NonBlockingHashMapLong;
 
-import java.lang.ClassValue;
+import java.io.IOException;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
-
-import java.io.IOException;
-import java.io.PrintStream;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import static org.jruby.util.CodegenUtils.ci;
+import me.qmx.jitescript.JDKVersion;
+import me.qmx.jitescript.JiteClass;
+
 import static org.jruby.util.CodegenUtils.p;
-import static org.jruby.util.CodegenUtils.sig;
 
 /**
  * A generator for DynamicScope subclasses, using fields for storage and specializing appropriate methods.
@@ -105,8 +108,9 @@ public class DynamicScopeGenerator {
 
         // acquire constructor handle and store it
         try {
+//            MethodHandle mh = MethodHandles.lookup().findStatic(p, "newScope", MethodType.methodType(DynamicScope.class, StaticScope.class, DynamicScope.class));
             MethodHandle mh = MethodHandles.lookup().findConstructor(p, MethodType.methodType(void.class, StaticScope.class, DynamicScope.class));
-            mh = mh.asType(MethodType.methodType(DynamicScope.class, StaticScope.class, DynamicScope.class));
+//            mh = mh.asType(MethodType.methodType(p, StaticScope.class, DynamicScope.class));
             MethodHandle previousMH = specializedFactories.putIfAbsent(size, mh);
             if (previousMH != null) mh = previousMH;
 
@@ -147,14 +151,20 @@ public class DynamicScopeGenerator {
             generateConstructor(dexMaker, dexClass, baseClass);
             TypeId<IRubyObject> iRubyObjectTypeId = TypeId.get(IRubyObject.class);
 
+
+            TypeId<StaticScope> staticScopeTypeId = TypeId.get(StaticScope.class);
+            TypeId<DynamicScope> dynamicScopeTypeId = TypeId.get(DynamicScope.class);
+            TypeId<RuntimeException> runtimeExceptionTypeId = TypeId.get(RuntimeException.class);
+
+            generateNewScopeMethod(dexMaker, dexClass, staticScopeTypeId, dynamicScopeTypeId);
+
             // getValue
             MethodId<T, IRubyObject> getValueMethod = dexClass.getMethod(iRubyObjectTypeId, "getValue", TypeId.INT, TypeId.INT);
-            Code code = dexMaker.declare(getValueMethod,  Modifier.PUBLIC);
+            Code code = dexMaker.declare(getValueMethod, Modifier.PUBLIC);
             Local<Integer> depth = code.getParameter(1, TypeId.INT);
             Local<Integer> zero = code.newLocal(TypeId.INT);
             Local<Integer> one = code.newLocal(TypeId.INT);
             com.android.dx.Label parentCall = new com.android.dx.Label();
-            TypeId<RuntimeException> runtimeExceptionTypeId = TypeId.get(RuntimeException.class);
             Local<RuntimeException> sizeErrorVar = code.newLocal(runtimeExceptionTypeId);
             Local<Integer> offset = code.getParameter(0, TypeId.INT);
             Local<DynamicScope> parent = code.newLocal(baseClass);
@@ -286,7 +296,7 @@ public class DynamicScopeGenerator {
             code.throwValue(sizeErrorVar);
 
             // setValueDepthZero
-            MethodId<T, Void> setValueDepthZeroMethod = dexClass.getMethod(TypeId.VOID, "setValueDepthZero", iRubyObjectTypeId, TypeId.INT);
+            MethodId<T, IRubyObject> setValueDepthZeroMethod = dexClass.getMethod(iRubyObjectTypeId, "setValueDepthZero", iRubyObjectTypeId, TypeId.INT);
             code = dexMaker.declare(setValueDepthZeroMethod, Modifier.PUBLIC);
             offset = code.getParameter(1, TypeId.INT);
             value = code.getParameter(0, iRubyObjectTypeId);
@@ -310,7 +320,7 @@ public class DynamicScopeGenerator {
                     code.mark(cases[i]);
                     FieldId<T, IRubyObject> selectedField = dexClass.getField(iRubyObjectTypeId, newFields[i]);
                     code.iput(selectedField, thisLocal, value);
-                    code.returnVoid();
+                    code.returnValue(value);
                 }
                 code.mark(defaultError);
             }
@@ -392,6 +402,7 @@ public class DynamicScopeGenerator {
             }
 
             // utilities
+            // Method "sizeError"
             MethodId<T, RuntimeException> sizeErrorMethodId = dexClass.getMethod(runtimeExceptionTypeId, "sizeError");
             code = dexMaker.declare(sizeErrorMethodId, Modifier.PRIVATE | Modifier.STATIC);
             Local<String> message = code.newLocal(TypeId.STRING);
@@ -400,9 +411,22 @@ public class DynamicScopeGenerator {
             MethodId<RuntimeException, Void> runtimeExceptionInit = runtimeExceptionTypeId.getMethod(TypeId.VOID, "<init>", TypeId.STRING);
             code.newInstance(returnValue, runtimeExceptionInit, message);
             code.returnValue(returnValue);
+
             ClassLoader loader = dexMaker.generateAndLoad((ClassLoader) CDCL, null);
             return loader.loadClass(clsName);
         }
+    }
+
+    // static scope constructor method to work around Android not handling invokeExact right
+    private static <T extends DynamicScope> void generateNewScopeMethod(DexMaker dexMaker, TypeId<T> dexClass, TypeId<StaticScope> staticScopeTypeId, TypeId<DynamicScope> dynamicScopeTypeId) {
+        MethodId<T, DynamicScope> newScopeMethod = dexClass.getMethod(dynamicScopeTypeId, "newScope", staticScopeTypeId, dynamicScopeTypeId);
+        Code code = dexMaker.declare(newScopeMethod, Modifier.PUBLIC | Modifier.STATIC);
+        Local<StaticScope> staticScopeParam = code.getParameter(0, staticScopeTypeId);
+        Local<DynamicScope> dynamicScopeParam = code.getParameter(1, dynamicScopeTypeId);
+        Local<DynamicScope> newScopeReturnValue = code.newLocal(dynamicScopeTypeId);
+        MethodId<T, DynamicScope> constructor = dexClass.getMethod(dynamicScopeTypeId, "<init>", staticScopeTypeId, dynamicScopeTypeId);
+        code.invokeStatic(constructor, newScopeReturnValue, staticScopeParam, dynamicScopeParam);
+        code.returnValue(newScopeReturnValue);
     }
 
     private static MethodHandle getClassFromSize(int size) {
